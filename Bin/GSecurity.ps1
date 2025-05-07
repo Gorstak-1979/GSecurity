@@ -3,13 +3,11 @@
 <#
     GSecurity.ps1 - Comprehensive System Security Script
     Author: Gorstak
-    Date: May 06, 2025
-    Description: browser virtualization, audio settings, WebRTC/remote desktop/plugin management, network/service hardening, privilege rights, WDAC policies, antivirus with DLL monitoring and killing, VirusTotal integration, telemetry corruption, VPN monitoring, security rule application (YARA, Sigma, Snort), device restriction, UAC configuration, process monitoring, VM killing, web server killing, and other features.
+    Date: May 07, 2025
+    Description: Browser virtualization, audio settings, WebRTC/remote desktop/plugin management, network/service hardening, privilege rights, WDAC policies, antivirus with DLL monitoring and killing, VirusTotal integration, telemetry corruption, VPN monitoring, security rule application (YARA, Sigma, Snort), device restriction, UAC configuration, process monitoring, VM killing, web server killing, and other features.
 #>
 
 param (
-    [switch]$Start,
-    [switch]$AddToStartup,
     [string]$VirusTotalApiKey = "46219682e8f5d9ab59eebc93a442dab6a9577e33d1f6f3ed47720252782fd6a3"  # Replace with your actual VirusTotal API key
 )
 
@@ -32,13 +30,14 @@ try {
     $window = [Win32]::GetForegroundWindow()
     [Win32]::ShowWindow($window, 0) | Out-Null
 } catch {
-    # Silent fail if window hiding doesn't work
+    Write-Log "Failed to hide PowerShell window: $_" -EntryType "Warning" -Color "Yellow"
 }
 
 # Initialize Event Log source
-$eventSource = "CombinedSecurity"
+$eventSource = "GSecurity"
 if (-not [System.Diagnostics.EventLog]::SourceExists($eventSource)) {
-    New-EventLog -LogName "Application" -Source $eventSource
+    New-EventLog -LogName "Application" -Source $eventSource -ErrorAction SilentlyContinue
+    Write-Log "Created Event Log source: $eventSource"
 }
 
 # Log function (combines Event Log and file logging)
@@ -48,11 +47,15 @@ function Write-Log {
         [string]$EntryType = "Information",
         [string]$Color = "Green"
     )
-    $logPath = [System.IO.Path]::Combine($env:USERPROFILE, "Documents\CombinedSecurity_Log.txt")
+    $logDir = [System.IO.Path]::Combine($env:USERPROFILE, "Documents")
+    $logPath = [System.IO.Path]::Combine($logDir, "GSecurity_Log.txt")
+    if (-not (Test-Path $logDir)) {
+        New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+    }
     $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     $logMessage = "$timestamp - $Message"
     try {
-        Write-EventLog -LogName "Application" -Source $eventSource -EventId 1000 -EntryType $EntryType -Message $Message
+        Write-EventLog -LogName "Application" -Source $eventSource -EventId 1000 -EntryType $EntryType -Message $Message -ErrorAction SilentlyContinue
         Add-Content -Path $logPath -Value $logMessage -ErrorAction SilentlyContinue
         Write-Host "[$timestamp] $Message" -ForegroundColor $Color
     } catch {
@@ -62,10 +65,8 @@ function Write-Log {
 
 # Define paths and constants
 $scriptDir = "C:\Windows\Setup\Scripts"
-$scriptPath = "$scriptDir\CombinedSecurity.ps1"
+$scriptPath = "$scriptDir\GSecurity.ps1"
 $quarantineFolder = "C:\Quarantine"
-$taskName = "CombinedSecurityStartup"
-$taskDescription = "Runs the CombinedSecurity script at startup with SYSTEM privileges."
 $scannedFiles = @{}  # Cache for VirusTotal scan results
 $lastTelemetryCorruptTime = [DateTime]::MinValue
 $whitelistedProcesses = @(
@@ -77,7 +78,7 @@ $whitelistedProcesses = @(
 $originalPolicy = Get-ExecutionPolicy -Scope Process
 if ($originalPolicy -ne "Unrestricted") {
     Write-Log "Setting execution policy to Unrestricted for this session..."
-    Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope Process -Force
+    Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Scope Process -Force -ErrorAction SilentlyContinue
 }
 
 # Check admin privileges
@@ -86,6 +87,9 @@ if (-not $isAdmin) {
     Write-Log "Script requires administrative privileges." -EntryType "Error" -Color "Red"
     exit 1
 }
+
+# Log startup
+Write-Log "Script started. VirusTotalApiKey: $(if ($VirusTotalApiKey) { 'Provided' } else { 'Not provided' })"
 
 # Ensure script directory and copy script
 if (-not (Test-Path $scriptDir)) {
@@ -97,276 +101,291 @@ if (-not (Test-Path $scriptPath) -or (Get-Item $scriptPath).LastWriteTime -lt (G
     Write-Log "Copied/Updated script to: $scriptPath"
 }
 
-# Schedule startup task
-function Schedule-StartupTask {
-    $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if (-not $existingTask) {
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -Start"
-        $trigger = New-ScheduledTaskTrigger -AtStartup
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Description $taskDescription
-        Register-ScheduledTask -TaskName $taskName -InputObject $task -Force
-        Write-Log "Scheduled task '$taskName' registered to run as SYSTEM."
-    }
-}
-
-# Add to startup (optional)
-function Add-ToStartup {
-    $startupFolder = [Environment]::GetFolderPath("Startup")
-    $shortcutPath = Join-Path $startupFolder "CombinedSecurity.lnk"
-    if (-not (Test-Path $shortcutPath)) {
-        Write-Log "Adding script to startup..."
-        $shell = New-Object -ComObject WScript.Shell
-        $shortcut = $shell.CreateShortcut($shortcutPath)
-        $shortcut.TargetPath = "powershell.exe"
-        $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Start"
-        $shortcut.Save()
-        Write-Log "Script added to startup."
-    }
-}
-
-# Ensure quarantine folder
+# Ensure quarantine folder and set permissions
 function Initialize-Quarantine {
-    if (-not (Test-Path $quarantineFolder)) {
-        New-Item -ItemType Directory -Path $quarantineFolder -Force | Out-Null
-        Write-Log "Created quarantine folder at $quarantineFolder"
+    try {
+        if (-not (Test-Path $quarantineFolder)) {
+            New-Item -ItemType Directory -Path $quarantineFolder -Force | Out-Null
+            Write-Log "Created quarantine folder at $quarantineFolder"
+        }
+        icacls $quarantineFolder /grant "Administrators:F" /T | Out-Null
+        icacls $quarantineFolder /grant "SYSTEM:F" /T | Out-Null
+        icacls $quarantineFolder /inheritance:d | Out-Null
+        Write-Log "Set permissions on quarantine folder: Administrators and SYSTEM full control, inheritance disabled"
+    } catch {
+        Write-Log "Failed to initialize quarantine folder: $_" -EntryType "Error" -Color "Red"
     }
 }
 
-# Browser virtualization (from GS2.ps1)
-function Harden-BrowserVirtualization-GS2 {
-    Write-Log "Starting browser virtualization (GS2)..."
-    function IsVirtualizedProcess([string]$processName) {
-        $virtualizedProcesses = Get-AppvClientPackage | Get-AppvClientProcess -ErrorAction SilentlyContinue
-        return $virtualizedProcesses.Name -contains $processName
+# Browser virtualization
+function Harden-BrowserVirtualization {
+    Write-Log "Starting browser virtualization..."
+    try {
+        function IsVirtualizedProcess([string]$processName) {
+            $virtualizedProcesses = Get-AppvClientPackage | Get-AppvClientProcess -ErrorAction SilentlyContinue
+            return $virtualizedProcesses.Name -contains $processName
+        }
+        function LaunchVirtualizedProcess([string]$executablePath) {
+            if (Test-Path $executablePath) {
+                Write-Log "Launching virtualized process: $executablePath"
+                Start-AppvVirtualProcess -AppvClientObject (Get-AppvClientPackage) -AppvVirtualPath $executablePath -ErrorAction SilentlyContinue
+            } else {
+                Write-Log "Error: Executable not found at $executablePath" -EntryType "Warning" -Color "Yellow"
+            }
+        }
+        function EnableAppV {
+            $hyperVAppVState = (Get-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V-AppV" -ErrorAction SilentlyContinue).State
+            if ($hyperVAppVState -ne "Enabled") {
+                Write-Log "Enabling App-V feature..."
+                Enable-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V-AppV" -NoRestart -ErrorAction SilentlyContinue
+            }
+        }
+        $installedBrowsers = Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+                            Where-Object { $_.DisplayName -match "chrome|firefox|msedge|opera|waterfox|chromium|ur|vivaldi|brave" } |
+                            Select-Object -ExpandProperty DisplayName
+        foreach ($browser in $installedBrowsers) {
+            if (-not (IsVirtualizedProcess "$browser.exe")) {
+                EnableAppV
+                $virtualizedPath = "C:\Program Files\AppVirt\VirtualizedBrowsers\$($browser).exe"
+                LaunchVirtualizedProcess $virtualizedPath
+            }
+        }
+        Write-Log "Browser virtualization complete."
+    } catch {
+        Write-Log "Error in browser virtualization: $_" -EntryType "Error" -Color "Red"
     }
-    function LaunchVirtualizedProcess([string]$executablePath) {
-        if (Test-Path $executablePath) {
-            Write-Log "Launching virtualized process: $executablePath"
-            Start-AppvVirtualProcess -AppvClientObject (Get-AppvClientPackage) -AppvVirtualPath $executablePath -ErrorAction SilentlyContinue
+}
+
+# Audio settings (enhancements)
+function Harden-AudioSettings-Enhancements {
+    Write-Log "Configuring audio settings (enhancements)..."
+    try {
+        $renderDevicesKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
+        $audioDevices = Get-ChildItem -Path $renderDevicesKey -ErrorAction SilentlyContinue
+        foreach ($device in $audioDevices) {
+            $fxPropertiesKey = "$($device.PSPath)\FxProperties"
+            if (-not (Test-Path $fxPropertiesKey)) {
+                New-Item -Path $fxPropertiesKey -Force | Out-Null
+                Write-Log "Created FxProperties key for device: $($device.PSChildName)"
+            }
+            $aecKey = "{1c7b1faf-caa2-451b-b0a4-87b19a93556a},6"
+            $noiseKey = "{e0f158e1-cb04-43d5-b6cc-3eb27e4db2a1},3"
+            $enableValue = 1
+            $currentAEC = Get-ItemProperty -Path $fxPropertiesKey -Name $aecKey -ErrorAction SilentlyContinue
+            if ($currentAEC.$aecKey -ne $enableValue) {
+                Set-ItemProperty -Path $fxPropertiesKey -Name $aecKey -Value $enableValue
+                Write-Log "Acoustic Echo Cancellation enabled for device: $($device.PSChildName)" -Color "Yellow"
+            }
+            $currentNoise = Get-ItemProperty -Path $fxPropertiesKey -Name $noiseKey -ErrorAction SilentlyContinue
+            if ($currentNoise.$noiseKey -ne $enableValue) {
+                Set-ItemProperty -Path $fxPropertiesKey -Name $noiseKey -Value $enableValue
+                Write-Log "Noise Suppression enabled for device: $($device.PSChildName)" -Color "Yellow"
+            }
+        }
+        Write-Log "Audio settings (enhancements) configured."
+    } catch {
+        Write-Log "Error configuring audio enhancements: $_" -EntryType "Error" -Color "Red"
+    }
+}
+
+# Audio settings (disable enhancements)
+function Harden-AudioSettings {
+    Write-Log "Configuring audio settings..."
+    try {
+        $audioKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
+        Get-ChildItem -Path $audioKey | ForEach-Object {
+            $propertiesPath = "$($_.PSPath)\Properties"
+            if (Test-Path $propertiesPath) {
+                Set-ItemProperty -Path $propertiesPath -Name "{b3f8fa53-0004-438e-9003-51a46e139bfc},2" -Value 0 -ErrorAction SilentlyContinue
+                Write-Log "Disabled audio enhancements for device: $($_.PSChildName)"
+            }
+        }
+        Write-Log "Audio settings configured."
+    } catch {
+        Write-Log "Error configuring audio settings: $_" -EntryType "Error" -Color "Red"
+    }
+}
+
+# Browser settings
+function Harden-BrowserSettings {
+    Write-Log "Configuring browser settings..."
+    try {
+        $desiredSettings = @{
+            "media_stream" = 2
+            "webrtc"       = 2
+            "remote"       = @{
+                "enabled" = $false
+                "support" = $false
+            }
+        }
+        function Check-And-Apply-Settings {
+            param ([string]$browserName, [string]$prefsPath)
+            if (Test-Path $prefsPath) {
+                $prefsContent = Get-Content -Path $prefsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($prefsContent) {
+                    $settingsChanged = $false
+                    if ($prefsContent.profile -and $prefsContent.profile["default_content_setting_values"]) {
+                        foreach ($key in $desiredSettings.Keys | Where-Object { $_ -ne "remote" }) {
+                            if ($prefsContent.profile["default_content_setting_values"][$key] -ne $desiredSettings[$key]) {
+                                $prefsContent.profile["default_content_setting_values"][$key] = $desiredSettings[$key]
+                                $settingsChanged = $true
+                            }
+                        }
+                    }
+                    if ($prefsContent.remote) {
+                        foreach ($key in $desiredSettings["remote"].Keys) {
+                            if ($prefsContent.remote[$key] -ne $desiredSettings["remote"][$key]) {
+                                $prefsContent.remote[$key] = $desiredSettings["remote"][$key]
+                                $settingsChanged = $true
+                            }
+                        }
+                    }
+                    if ($settingsChanged) {
+                        $prefsContent | ConvertTo-Json -Compress | Set-Content -Path $prefsPath
+                        Write-Log "${browserName}: Updated WebRTC and remote desktop settings."
+                    }
+                    if ($prefsContent.plugins) {
+                        foreach ($plugin in $prefsContent.plugins) {
+                            $plugin.enabled = $false
+                        }
+                        Write-Log "${browserName}: Plugins disabled."
+                    }
+                }
+            }
+        }
+        function Configure-Firefox {
+            $firefoxProfilePath = "$env:APPDATA\Mozilla\Firefox\Profiles"
+            if (Test-Path $firefoxProfilePath) {
+                $firefoxProfiles = Get-ChildItem -Path $firefoxProfilePath -Directory
+                foreach ($profile in $firefoxProfiles) {
+                    $prefsJsPath = "$($profile.FullName)\prefs.js"
+                    if (Test-Path $prefsJsPath) {
+                        $prefsJsContent = Get-Content -Path $prefsJsPath
+                        if ($prefsJsContent -notmatch 'user_pref\("media.peerconnection.enabled", false\)') {
+                            Add-Content -Path $prefsJsPath 'user_pref("media.peerconnection.enabled", false);'
+                            Write-Log "Firefox profile ${profile.FullName}: WebRTC disabled."
+                        }
+                    }
+                }
+            }
+        }
+        $browsers = @{
+            "Chrome" = "$env:LOCALAPPDATA\Google\Chrome\User Data\Preferences"
+            "Brave" = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data\Preferences"
+            "Vivaldi" = "$env:LOCALAPPDATA\Vivaldi\User Data\Preferences"
+            "Edge" = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Preferences"
+            "Opera" = "$env:APPDATA\Opera Software\Opera Stable\Preferences"
+            "OperaGX" = "$env:APPDATA\Opera Software\Opera GX Stable\Preferences"
+        }
+        foreach ($browser in $browsers.GetEnumerator()) {
+            if (Test-Path $browser.Value) {
+                Check-And-Apply-Settings -browserName $browser.Key -prefsPath $browser.Value
+            }
+        }
+        Configure-Firefox
+        Write-Log "Browser settings configured."
+    } catch {
+        Write-Log "Error configuring browser settings: $_" -EntryType "Error" -Color "Red"
+    }
+}
+
+# Disable Chrome Remote Desktop
+function Disable-ChromeRemoteDesktop {
+    Write-Log "Disabling Chrome Remote Desktop..."
+    try {
+        $serviceName = "chrome-remote-desktop-host"
+        if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
+            Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $serviceName -StartupType Disabled -ErrorAction SilentlyContinue
+            Write-Log "Chrome Remote Desktop Host service stopped and disabled."
+        }
+        $browsers = @("chrome", "msedge", "brave", "vivaldi", "opera", "operagx")
+        foreach ($browser in $browsers) {
+            $processes = Get-Process -Name $browser -ErrorAction SilentlyContinue
+            if ($processes) {
+                Stop-Process -Name $browser -Force -ErrorAction SilentlyContinue
+                Write-Log "Terminated process: $browser"
+            }
+        }
+        $ruleName = "Block CRD Ports"
+        if (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue) {
+            Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+        }
+        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort 443 -Action Block -Profile Any -ErrorAction SilentlyContinue
+        Write-Log "Chrome Remote Desktop disabled."
+    } catch {
+        Write-Log "Error disabling Chrome Remote Desktop: $_" -EntryType "Error" -Color "Red"
+    }
+}
+
+# Network and services hardening
+function Harden-NetworkAndServices {
+    Write-Log "Hardening network and services..."
+    try {
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1 -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Remote Assistance' -Name 'fAllowToGetHelp' -Value 0 -ErrorAction SilentlyContinue
+        Stop-Service -Name "TermService" -Force -ErrorAction SilentlyContinue
+        Set-Service -Name "TermService" -StartupType Disabled -ErrorAction SilentlyContinue
+        Disable-PSRemoting -Force -ErrorAction SilentlyContinue
+        Stop-Service -Name "WinRM" -Force -ErrorAction SilentlyContinue
+        Set-Service -Name "WinRM" -StartupType Disabled -ErrorAction SilentlyContinue
+        Set-SmbServerConfiguration -EnableSMB1Protocol $false -EnableSMB2Protocol $false -Force -ErrorAction SilentlyContinue
+        $telnetFeature = Get-WindowsOptionalFeature -Online -FeatureName "TelnetClient" -ErrorAction SilentlyContinue
+        if ($telnetFeature -and $telnetFeature.State -eq "Enabled") {
+            Disable-WindowsOptionalFeature -Online -FeatureName "TelnetClient" -NoRestart -ErrorAction SilentlyContinue
+            Write-Log "Disabled TelnetClient feature."
         } else {
-            Write-Log "Error: Executable not found at $executablePath" -Color "Red"
+            Write-Log "TelnetClient feature not found or already disabled."
         }
-    }
-    function EnableAppV {
-        $hyperVAppVState = (Get-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V-AppV" -ErrorAction SilentlyContinue).State
-        if ($hyperVAppVState -ne "Enabled") {
-            Write-Log "Enabling App-V feature..."
-            Enable-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V-AppV" -NoRestart -ErrorAction Stop
+        Get-NetAdapter | ForEach-Object {
+            Set-NetAdapterAdvancedProperty -Name $_.Name -DisplayName "Wake on Magic Packet" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
+            Set-NetAdapterAdvancedProperty -Name $_.Name -DisplayName "Wake on Pattern Match" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
         }
-    }
-    $installedBrowsers = Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-                        Where-Object { $_.DisplayName -match "chrome|firefox|msedge|opera|waterfox|chromium|ur|vivaldi|brave" } |
-                        Select-Object -ExpandProperty DisplayName
-    foreach ($browser in $installedBrowsers) {
-        if (-not (IsVirtualizedProcess "$browser.exe")) {
-            EnableAppV
-            $virtualizedPath = "C:\Program Files\AppVirt\VirtualizedBrowsers\$($browser).exe"
-            LaunchVirtualizedProcess $virtualizedPath
-        }
-    }
-    Write-Log "Browser virtualization (GS2) complete."
-}
-
-# Audio settings (from GS2.ps1)
-function Harden-AudioSettings-GS2 {
-    Write-Log "Configuring audio settings (GS2)..."
-    $renderDevicesKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
-    $audioDevices = Get-ChildItem -Path $renderDevicesKey -ErrorAction SilentlyContinue
-    foreach ($device in $audioDevices) {
-        $fxPropertiesKey = "$($device.PSPath)\FxProperties"
-        if (-not (Test-Path $fxPropertiesKey)) {
-            New-Item -Path $fxPropertiesKey -Force | Out-Null
-            Write-Log "Created FxProperties key for device: $($device.PSChildName)"
-        }
-        $aecKey = "{1c7b1faf-caa2-451b-b0a4-87b19a93556a},6"
-        $noiseKey = "{e0f158e1-cb04-43d5-b6cc-3eb27e4db2a1},3"
-        $enableValue = 1
-        $currentAEC = Get-ItemProperty -Path $fxPropertiesKey -Name $aecKey -ErrorAction SilentlyContinue
-        if ($currentAEC.$aecKey -ne $enableValue) {
-            Set-ItemProperty -Path $fxPropertiesKey -Name $aecKey -Value $enableValue
-            Write-Log "Acoustic Echo Cancellation enabled for device: $($device.PSChildName)" -Color "Yellow"
-        }
-        $currentNoise = Get-ItemProperty -Path $fxPropertiesKey -Name $noiseKey -ErrorAction SilentlyContinue
-        if ($currentNoise.$noiseKey -ne $enableValue) {
-            Set-ItemProperty -Path $fxPropertiesKey -Name $noiseKey -Value $enableValue
-            Write-Log "Noise Suppression enabled for device: $($device.PSChildName)" -Color "Yellow"
-        }
-    }
-    Write-Log "Audio settings (GS2) configured."
-}
-
-# Audio settings (from GSecurity.ps1)
-function Harden-AudioSettings-GSecurity {
-    Write-Log "Configuring audio settings (GSecurity)..."
-    $audioKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
-    Get-ChildItem -Path $audioKey | ForEach-Object {
-        $propertiesPath = "$($_.PSPath)\Properties"
-        if (Test-Path $propertiesPath) {
-            Set-ItemProperty -Path $propertiesPath -Name "{b3f8fa53-0004-438e-9003-51a46e139bfc},2" -Value 0 -ErrorAction SilentlyContinue
-            Write-Log "Disabled audio enhancements for device: $($_.PSChildName)"
-        }
-    }
-    Write-Log "Audio settings (GSecurity) configured."
-}
-
-# Browser settings (from GSecurity.ps1)
-function Harden-BrowserSettings-GSecurity {
-    Write-Log "Configuring browser settings (GSecurity)..."
-    $desiredSettings = @{
-        "media_stream" = 2
-        "webrtc"       = 2
-        "remote"       = @{
-            "enabled" = $false
-            "support" = $false
-        }
-    }
-    function Check-And-Apply-Settings {
-        param ([string]$browserName, [string]$prefsPath)
-        if (Test-Path $prefsPath) {
-            $prefsContent = Get-Content -Path $prefsPath -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
-            if ($prefsContent) {
-                $settingsChanged = $false
-                if ($prefsContent.profile -and $prefsContent.profile["default_content_setting_values"]) {
-                    foreach ($key in $desiredSettings.Keys | Where-Object { $_ -ne "remote" }) {
-                        if ($prefsContent.profile["default_content_setting_values"][$key] -ne $desiredSettings[$key]) {
-                            $prefsContent.profile["default_content_setting_values"][$key] = $desiredSettings[$key]
-                            $settingsChanged = $true
-                        }
-                    }
-                }
-                if ($prefsContent.remote) {
-                    foreach ($key in $desiredSettings["remote"].Keys) {
-                        if ($prefsContent.remote[$key] -ne $desiredSettings["remote"][$key]) {
-                            $prefsContent.remote[$key] = $desiredSettings["remote"][$key]
-                            $settingsChanged = $true
-                        }
-                    }
-                }
-                if ($settingsChanged) {
-                    $prefsContent | ConvertTo-Json -Compress | Set-Content -Path $prefsPath
-                    Write-Log "${browserName}: Updated WebRTC and remote desktop settings."
-                }
-                if ($prefsContent.plugins) {
-                    foreach ($plugin in $prefsContent.plugins) {
-                        $plugin.enabled = $false
-                    }
-                    Write-Log "${browserName}: Plugins disabled."
-                }
+        $rules = @(
+            @{DisplayName="Block RDP"; LocalPort=3389; Protocol="TCP"},
+            @{DisplayName="Block SMB TCP 445"; LocalPort=445; Protocol="TCP"},
+            @{DisplayName="Block Telnet"; LocalPort=23; Protocol="TCP"}
+        )
+        foreach ($rule in $rules) {
+            if (-not (Get-NetFirewallRule -DisplayName $rule.DisplayName -ErrorAction SilentlyContinue)) {
+                New-NetFirewallRule -DisplayName $rule.DisplayName -Direction Inbound -LocalPort $rule.LocalPort -Protocol $rule.Protocol -Action Block -ErrorAction SilentlyContinue
             }
         }
+        Write-Log "Network and services hardened."
+    } catch {
+        Write-Log "Error hardening network and services: $_" -EntryType "Error" -Color "Red"
     }
-    function Configure-Firefox {
-        $firefoxProfilePath = "$env:APPDATA\Mozilla\Firefox\Profiles"
-        if (Test-Path $firefoxProfilePath) {
-            $firefoxProfiles = Get-ChildItem -Path $firefoxProfilePath -Directory
-            foreach ($profile in $firefoxProfiles) {
-                $prefsJsPath = "$($profile.FullName)\prefs.js"
-                if (Test-Path $prefsJsPath) {
-                    $prefsJsContent = Get-Content -Path $prefsJsPath
-                    if ($prefsJsContent -notmatch 'user_pref\("media.peerconnection.enabled", false\)') {
-                        Add-Content -Path $prefsJsPath 'user_pref("media.peerconnection.enabled", false);'
-                        Write-Log "Firefox profile ${profile.FullName}: WebRTC disabled."
-                    }
-                }
+}
+
+# Network optimization
+function Optimize-Network {
+    Write-Log "Optimizing network settings..."
+    try {
+        $componentsToDisable = @("ms_server", "ms_msclient", "ms_pacer", "ms_lltdio", "ms_rspndr", "ms_tcpip6")
+        $adapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
+        foreach ($adapter in $adapters) {
+            foreach ($component in $componentsToDisable) {
+                Disable-NetAdapterBinding -Name $adapter.Name -ComponentID $component -Confirm:$false -ErrorAction SilentlyContinue
+                Write-Log "Disabled $component on adapter $($adapter.Name)"
             }
         }
-    }
-    $browsers = @{
-        "Chrome" = "$env:LOCALAPPDATA\Google\Chrome\User Data\Preferences"
-        "Brave" = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data\Preferences"
-        "Vivaldi" = "$env:LOCALAPPDATA\Vivaldi\User Data\Preferences"
-        "Edge" = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Preferences"
-        "Opera" = "$env:APPDATA\Opera Software\Opera Stable\Preferences"
-        "OperaGX" = "$env:APPDATA\Opera Software\Opera GX Stable\Preferences"
-    }
-    foreach ($browser in $browsers.GetEnumerator()) {
-        if (Test-Path $browser.Value) {
-            Check-And-Apply-Settings -browserName $browser.Key -prefsPath $browser.Value
+        $ldapPorts = @(389, 636)
+        foreach ($port in $ldapPorts) {
+            $ruleName = "Block LDAP Port $port"
+            New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -Protocol TCP -RemotePort $port -Action Block -ErrorAction SilentlyContinue
+            Write-Log "Created firewall rule to block LDAP port $port"
         }
+        Write-Log "Network optimization complete."
+    } catch {
+        Write-Log "Error optimizing network: $_" -EntryType "Error" -Color "Red"
     }
-    Configure-Firefox
-    Write-Log "Browser settings (GSecurity) configured."
 }
 
-# Disable Chrome Remote Desktop (from GS2.ps1)
-function Disable-ChromeRemoteDesktop-GS2 {
-    Write-Log "Disabling Chrome Remote Desktop (GS2)..."
-    $serviceName = "chrome-remote-desktop-host"
-    if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
-        Stop-Service -Name $serviceName -Force
-        Set-Service -Name $serviceName -StartupType Disabled
-        Write-Log "Chrome Remote Desktop Host service stopped and disabled."
-    }
-    $browsers = @("chrome", "msedge", "brave", "vivaldi", "opera", "operagx")
-    foreach ($browser in $browsers) {
-        $processes = Get-Process -Name $browser -ErrorAction SilentlyContinue
-        if ($processes) {
-            Stop-Process -Name $browser -Force
-            Write-Log "Terminated process: $browser"
-        }
-    }
-    $ruleName = "Block CRD Ports"
-    if (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue) {
-        Remove-NetFirewallRule -DisplayName $ruleName
-    }
-    New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort 443 -Action Block -Profile Any
-    Write-Log "Chrome Remote Desktop (GS2) disabled."
-}
-
-# Network and services hardening (from GS2.ps1)
-function Harden-NetworkAndServices-GS2 {
-    Write-Log "Hardening network and services (GS2)..."
-    Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 1
-    Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Remote Assistance' -Name 'fAllowToGetHelp' -Value 0
-    Stop-Service -Name "TermService" -Force -ErrorAction SilentlyContinue
-    Set-Service -Name "TermService" -StartupType Disabled -ErrorAction SilentlyContinue
-    Disable-PSRemoting -Force -ErrorAction SilentlyContinue
-    Stop-Service -Name "WinRM" -Force -ErrorAction SilentlyContinue
-    Set-Service -Name "WinRM" -StartupType Disabled -ErrorAction SilentlyContinue
-    Set-SmbServerConfiguration -EnableSMB1Protocol $false -EnableSMB2Protocol $false -Force -ErrorAction SilentlyContinue
-    Disable-WindowsOptionalFeature -Online -FeatureName "TelnetClient" -NoRestart -ErrorAction SilentlyContinue
-    Get-NetAdapter | ForEach-Object {
-        Set-NetAdapterAdvancedProperty -Name $_.Name -DisplayName "Wake on Magic Packet" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
-        Set-NetAdapterAdvancedProperty -Name $_.Name -DisplayName "Wake on Pattern Match" -DisplayValue "Disabled" -ErrorAction SilentlyContinue
-    }
-    $rules = @(
-        @{DisplayName="Block RDP"; LocalPort=3389; Protocol="TCP"},
-        @{DisplayName="Block SMB TCP 445"; LocalPort=445; Protocol="TCP"},
-        @{DisplayName="Block Telnet"; LocalPort=23; Protocol="TCP"}
-    )
-    foreach ($rule in $rules) {
-        if (-not (Get-NetFirewallRule -DisplayName $rule.DisplayName -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName $rule.DisplayName -Direction Inbound -LocalPort $rule.LocalPort -Protocol $rule.Protocol -Action Block -ErrorAction SilentlyContinue
-        }
-    }
-    Write-Log "Network and services (GS2) hardened."
-}
-
-# Network optimization (from GSecurity.ps1)
-function Optimize-Network-GSecurity {
-    Write-Log "Optimizing network settings (GSecurity)..."
-    $componentsToDisable = @("ms_server", "ms_msclient", "ms_pacer", "ms_lltdio", "ms_rspndr", "ms_tcpip6")
-    $adapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
-    foreach ($adapter in $adapters) {
-        foreach ($component in $componentsToDisable) {
-            Disable-NetAdapterBinding -Name $adapter.Name -ComponentID $component -Confirm:$false -ErrorAction SilentlyContinue
-            Write-Log "Disabled $component on adapter $($adapter.Name)"
-        }
-    }
-    $ldapPorts = @(389, 636)
-    foreach ($port in $ldapPorts) {
-        $ruleName = "Block LDAP Port $port"
-        New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -Protocol TCP -RemotePort $port -Action Block -ErrorAction SilentlyContinue
-        Write-Log "Created firewall rule to block LDAP port $port"
-    }
-    Write-Log "Network optimization (GSecurity) complete."
-}
-
-# Privilege rights (from GS2.ps1)
-function Harden-PrivilegeRights-GS2 {
-    Write-Log "Applying privilege rights (GS2)..."
-    $privilegeSettings = @'
+# Privilege rights (policy-based)
+function Harden-PrivilegeRights-Policy {
+    Write-Log "Applying privilege rights (policy-based)..."
+    try {
+        $privilegeSettings = @'
 [Privilege Rights]
 SeChangeNotifyPrivilege = *S-1-1-0
 SeInteractiveLogonRight = *S-1-5-32-544
@@ -385,45 +404,53 @@ SeLoadDriverPrivilege=
 SeRemoteInteractiveLogonRight=
 SeServiceLogonRight=
 '@
-    $cfgPath = "C:\secpol.cfg"
-    secedit /export /cfg $cfgPath /quiet
-    $privilegeSettings | Out-File -Append -FilePath $cfgPath
-    secedit /configure /db c:\windows\security\local.sdb /cfg $cfgPath /areas USER_RIGHTS /quiet
-    Remove-Item $cfgPath -Force
-    Write-Log "Privilege rights (GS2) applied."
-}
-
-# Privilege rights (from GS.ps1)
-function Harden-PrivilegeRights-GS {
-    Write-Log "Applying privilege rights (GS)..."
-    $privileges = @(
-        "SeAssignPrimaryTokenPrivilege",
-        "SeBackupPrivilege",
-        "SeCreateTokenPrivilege",
-        "SeDebugPrivilege",
-        "SeImpersonatePrivilege",
-        "SeLoadDriverPrivilege",
-        "SeRemoteShutdownPrivilege",
-        "SeServiceLogonRight"
-    )
-    foreach ($privilege in $privileges) {
-        secedit /export /cfg C:\temp_privileges.cfg /quiet
-        $currentConfig = Get-Content C:\temp_privileges.cfg
-        if ($currentConfig -notmatch "$privilege\s*=") {
-            Add-Content C:\temp_privileges.cfg "$privilege = "
-            secedit /configure /db c:\windows\security\local.sdb /cfg C:\temp_privileges.cfg /areas USER_RIGHTS /quiet
-            Write-Log "Removed $privilege from all accounts"
-        }
-        Remove-Item C:\temp_privileges.cfg -Force -ErrorAction SilentlyContinue
+        $cfgPath = "C:\secpol.cfg"
+        secedit /export /cfg $cfgPath /quiet
+        $privilegeSettings | Out-File -Append -FilePath $cfgPath
+        secedit /configure /db c:\windows\security\local.sdb /cfg $cfgPath /areas USER_RIGHTS /quiet
+        Remove-Item $cfgPath -Force -ErrorAction SilentlyContinue
+        Write-Log "Privilege rights (policy-based) applied."
+    } catch {
+        Write-Log "Error applying privilege rights (policy-based): $_" -EntryType "Error" -Color "Red"
     }
-    Write-Log "Privilege rights (GS) applied."
 }
 
-# WDAC policy (from GS2.ps1)
-function Harden-WDACPolicy-GS2 {
-    Write-Log "Applying WDAC policy (GS2)..."
-    Import-Module -Name WDAC -ErrorAction SilentlyContinue
-    $WDACPolicyXML = @"
+# Privilege rights (individual)
+function Harden-PrivilegeRights {
+    Write-Log "Applying privilege rights..."
+    try {
+        $privileges = @(
+            "SeAssignPrimaryTokenPrivilege",
+            "SeBackupPrivilege",
+            "SeCreateTokenPrivilege",
+            "SeDebugPrivilege",
+            "SeImpersonatePrivilege",
+            "SeLoadDriverPrivilege",
+            "SeRemoteShutdownPrivilege",
+            "SeServiceLogonRight"
+        )
+        foreach ($privilege in $privileges) {
+            secedit /export /cfg C:\temp_privileges.cfg /quiet
+            $currentConfig = Get-Content C:\temp_privileges.cfg
+            if ($currentConfig -notmatch "$privilege\s*=") {
+                Add-Content C:\temp_privileges.cfg "$privilege = "
+                secedit /configure /db c:\windows\security\local.sdb /cfg C:\temp_privileges.cfg /areas USER_RIGHTS /quiet
+                Write-Log "Removed $privilege from all accounts"
+            }
+            Remove-Item C:\temp_privileges.cfg -Force -ErrorAction SilentlyContinue
+        }
+        Write-Log "Privilege rights applied."
+    } catch {
+        Write-Log "Error applying privilege rights: $_" -EntryType "Error" -Color "Red"
+    }
+}
+
+# WDAC policy
+function Harden-WDACPolicy {
+    Write-Log "Applying WDAC policy..."
+    try {
+        Import-Module -Name WDAC -ErrorAction SilentlyContinue
+        $WDACPolicyXML = @"
 <?xml version="1.0" encoding="UTF-8"?>
 <SIPolicy PolicyType="SignedAndUnsigned" Version="1">
   <Settings>
@@ -452,64 +479,182 @@ function Harden-WDACPolicy-GS2 {
   </Rules>
 </SIPolicy>
 "@
-    $PolicyPath = "C:\WDACPolicy.xml"
-    $WDACBinaryPath = "C:\Windows\System32\CodeIntegrity\SiPolicy.p7b"
-    try {
+        $PolicyPath = "C:\WDACPolicy.xml"
+        $WDACBinaryPath = "C:\Windows\System32\CodeIntegrity\SiPolicy.p7b"
         $WDACPolicyXML | Out-File -Encoding utf8 -FilePath $PolicyPath
         ConvertFrom-CIPolicy -XmlFilePath $PolicyPath -BinaryFilePath $WDACBinaryPath
         Copy-Item -Path $WDACBinaryPath -Destination "C:\Windows\System32\CodeIntegrity\SiPolicy.p7b" -Force
-        Write-Log "WDAC policy (GS2) applied. Restart required."
+        Write-Log "WDAC policy applied. Restart required."
+        Remove-Item -Path $PolicyPath -Force -ErrorAction SilentlyContinue
     } catch {
-        Write-Log "Error applying WDAC policy (GS2): $_" -EntryType "Error" -Color "Red"
+        Write-Log "Error applying WDAC policy: $_" -EntryType "Error" -Color "Red"
     }
-    Remove-Item -Path $PolicyPath -Force -ErrorAction SilentlyContinue
 }
 
-# Device restriction (from GSecurity.ps1)
-function Restrict-Devices-GSecurity {
-    Write-Log "Restricting non-critical devices (GSecurity)..."
-    $currentSessionId = (Get-Process -PID $PID).SessionId
-    $criticalClasses = @("DiskDrive", "Volume", "Processor", "System", "Computer", "USB", "Net")
-    function Test-DeviceSession([string]$DeviceInstanceId) {
-        return $true  # Placeholder
-    }
-    $devices = Get-PnpDevice | Select-Object -Property Name, InstanceId, Status, Class
-    foreach ($device in $devices) {
-        if ($device.Status -eq "Error") {
-            Write-Log "Device '$($device.Name)' already disabled"
-            continue
-        }
-        if ($criticalClasses -contains $device.Class) {
-            Write-Log "Skipping critical device: $($device.Name) (Class: $($device.Class))"
-            continue
-        }
-        $isCurrentSessionDevice = Test-DeviceSession -DeviceInstanceId $device.InstanceId
-        if (-not $isCurrentSessionDevice) {
+# Antivirus with DLL monitoring
+function Monitor-FileSystem {
+    Write-Log "Starting file system monitoring..."
+    try {
+        $watcher = New-Object System.IO.FileSystemWatcher
+        $watcher.Path = $env:USERPROFILE
+        $watcher.IncludeSubdirectories = $true
+        $watcher.Filter = "*.dll"
+        $watcher.EnableRaisingEvents = $true
+        $action = {
+            $filePath = $Event.SourceEventArgs.FullPath
+            Write-Log "Detected DLL: $filePath" -Color "Yellow"
             try {
-                Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false
-                Write-Log "Disabled device: $($device.Name) (Class: $($device.Class))"
+                if (Test-Path $filePath) {
+                    $isSigned = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction SilentlyContinue
+                    if ($isSigned.Status -eq "Valid" -and $isSigned.SignerCertificate.Subject -match "Microsoft|Intel|AMD|NVIDIA") {
+                        Write-Log "DLL $filePath is signed by trusted vendor. Skipping." -Color "Green"
+                        return
+                    }
+                    $hash = (Get-FileHash -Path $filePath -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+                    if ($hash -and $scannedFiles.ContainsKey($hash)) {
+                        if ($scannedFiles[$hash].IsMalicious) {
+                            Write-Log "Known malicious DLL detected: $filePath" -EntryType "Warning" -Color "Yellow"
+                            Quarantine-File -FilePath $filePath
+                        } else {
+                            Write-Log "DLL $filePath previously scanned and clean." -Color "Green"
+                        }
+                        return
+                    }
+                    if ($VirusTotalApiKey) {
+                        $vtResult = Invoke-VirusTotalScan -FilePath $filePath -ApiKey $VirusTotalApiKey
+                        if ($vtResult.positives -gt 0) {
+                            Write-Log "VirusTotal flagged $filePath as malicious (Positives: $($vtResult.positives))." -EntryType "Warning" -Color "Yellow"
+                            $scannedFiles[$hash] = @{ IsMalicious = $true; Result = $vtResult }
+                            Quarantine-File -FilePath $filePath
+                        } else {
+                            Write-Log "VirusTotal scan clean for $filePath." -Color "Green"
+                            $scannedFiles[$hash] = @{ IsMalicious = $false; Result = $vtResult }
+                        }
+                    } else {
+                        Write-Log "No VirusTotal API key provided. Quarantining unsigned DLL: $filePath" -EntryType "Warning" -Color "Yellow"
+                        Quarantine-File -FilePath $filePath
+                    }
+                } else {
+                    Write-Log "File no longer exists: $filePath" -EntryType "Warning" -Color "Yellow"
+                }
             } catch {
-                Write-Log "Failed to disable $($device.Name): $_" -EntryType "Warning" -Color "Yellow"
+                Write-Log "Error processing DLL ${filePath}: $_" -EntryType "Error" -Color "Red"
             }
         }
+        Register-ObjectEvent -InputObject $watcher -EventName Created -SourceIdentifier FileCreated -Action $action
+        Register-ObjectEvent -InputObject $watcher -EventName Changed -SourceIdentifier FileChanged -Action $action
+        Write-Log "File system watcher registered for DLLs in $env:USERPROFILE"
+        while ($true) { Start-Sleep -Seconds 10 }
+    } catch {
+        Write-Log "Error in file system monitoring: $_" -EntryType "Error" -Color "Red"
     }
-    Write-Log "Device restriction (GSecurity) complete."
 }
 
-# UAC configuration (from GS.ps1)
-function Configure-UAC-GS {
-    Write-Log "Configuring UAC (GS)..."
-    $uacKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
-    Set-ItemProperty -Path $uacKey -Name "ConsentPromptBehaviorAdmin" -Value 5
-    Set-ItemProperty -Path $uacKey -Name "ConsentPromptBehaviorUser" -Value 3
-    Set-ItemProperty -Path $uacKey -Name "EnableLUA" -Value 1
-    Set-ItemProperty -Path $uacKey -Name "PromptOnSecureDesktop" -Value 1
-    Write-Log "UAC (GS) configured to highest notification level."
+# VirusTotal integration
+function Invoke-VirusTotalScan {
+    param (
+        [string]$filePath,
+        [string]$ApiKey
+    )
+    try {
+        $hash = (Get-FileHash -Path $filePath -Algorithm SHA256).Hash
+        $uri = "https://www.virustotal.com/vtapi/v2/file/report?apikey=$ApiKey&resource=$hash"
+        $response = Invoke-RestMethod -Uri $uri -Method Get
+        if ($response.response_code -eq 1) {
+            Write-Log "VirusTotal scan completed for $filePath (Hash: $hash)"
+            return $response
+        } else {
+            Write-Log "File not found in VirusTotal database. Uploading $filePath for scanning..." -Color "Yellow"
+            $uri = "https://www.virustotal.com/vtapi/v2/file/scan"
+            $fileBytes = [System.IO.File]::ReadAllBytes($filePath)
+            $boundary = [System.Guid]::NewGuid().ToString()
+            $body = "--$boundary`r`nContent-Disposition: form-data; name=`"apikey`"`r`n`r`n$ApiKey`r`n--$boundary`r`nContent-Disposition: form-data; name=`"file`"; filename=`"$([System.IO.Path]::GetFileName($filePath))`"`r`nContent-Type: application/octet-stream`r`n`r`n$([System.Text.Encoding]::Default.GetString($fileBytes))`r`n--$boundary--`r`n"
+            $response = Invoke-RestMethod -Uri $uri -Method Post -ContentType "multipart/form-data; boundary=$boundary" -Body $body
+            Start-Sleep -Seconds 15
+            $uri = "https://www.virustotal.com/vtapi/v2/file/report?apikey=$ApiKey&resource=$($response.scan_id)"
+            $response = Invoke-RestMethod -Uri $uri -Method Get
+            Write-Log "VirusTotal scan completed for uploaded file $filePath"
+            return $response
+        }
+    } catch {
+        Write-Log "Error scanning ${filePath}: $_" -EntryType "Error" -Color "Red"
+        return $null
+    }
 }
 
-# Telemetry corruption (from GS.ps1, full "corrupt environments" implementation)
-function Corrupt-Telemetry-GS {
-    Write-Log "Corrupting telemetry and environment data (GS)..."
+# Quarantine file
+function Quarantine-File {
+    param ([string]$filePath)
+    try {
+        if (-not (Test-Path $quarantineFolder)) {
+            Initialize-Quarantine
+        }
+        $fileName = [System.IO.Path]::GetFileName($filePath)
+        $destPath = Join-Path $quarantineFolder "$((Get-Date).ToString('yyyyMMdd_HHmmss'))_$fileName"
+        Move-Item -Path $filePath -Destination $destPath -Force -ErrorAction Stop
+        Write-Log "Quarantined file: $filePath to $destPath" -EntryType "Warning" -Color "Yellow"
+    } catch {
+        Write-Log "Failed to quarantine ${filePath}: $_" -EntryType "Error" -Color "Red"
+    }
+}
+
+# Kill suspicious DLLs
+function Kill-DLLs {
+    Write-Log "Scanning for suspicious DLLs..."
+    try {
+        $processes = Get-Process | Where-Object { $_.Path -and $whitelistedProcesses -notcontains $_.Name }
+        foreach ($process in $processes) {
+            try {
+                $modules = $process.Modules | Where-Object { $_.FileName -and $_.FileName.EndsWith(".dll") }
+                foreach ($module in $modules) {
+                    $filePath = $module.FileName
+                    $isSigned = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction SilentlyContinue
+                    if ($isSigned.Status -eq "Valid" -and $isSigned.SignerCertificate.Subject -match "Microsoft|Intel|AMD|NVIDIA") {
+                        Write-Log "DLL $filePath in process $($process.Name) is signed by trusted vendor. Skipping." -Color "Green"
+                        continue
+                    }
+                    $hash = (Get-FileHash -Path $filePath -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+                    if ($hash -and $scannedFiles.ContainsKey($hash)) {
+                        if ($scannedFiles[$hash].IsMalicious) {
+                            Write-Log "Known malicious DLL detected: $filePath in process $($process.Name)" -EntryType "Warning" -Color "Yellow"
+                            Quarantine-File -FilePath $filePath
+                            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                            Write-Log "Terminated process $($process.Name) (PID: $($process.Id)) hosting malicious DLL"
+                        }
+                        continue
+                    }
+                    if ($VirusTotalApiKey) {
+                        $vtResult = Invoke-VirusTotalScan -FilePath $filePath -ApiKey $VirusTotalApiKey
+                        if ($vtResult -and $vtResult.positives -gt 0) {
+                            Write-Log "VirusTotal flagged $filePath as malicious (Positives: $($vtResult.positives))." -EntryType "Warning" -Color "Yellow"
+                            $scannedFiles[$hash] = @{ IsMalicious = $true; Result = $vtResult }
+                            Quarantine-File -FilePath $filePath
+                            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                            Write-Log "Terminated process $($process.Name) (PID: $($process.Id)) hosting malicious DLL"
+                        } else {
+                            Write-Log "VirusTotal scan clean for $filePath in process $($process.Name)." -Color "Green"
+                            $scannedFiles[$hash] = @{ IsMalicious = $false; Result = $vtResult }
+                        }
+                    } else {
+                        Write-Log "No VirusTotal API key provided. Quarantining unsigned DLL: $filePath" -EntryType "Warning" -Color "Yellow"
+                        Quarantine-File -FilePath $filePath
+                        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                        Write-Log "Terminated process $($process.Name) (PID: $($process.Id)) hosting unsigned DLL"
+                    }
+                }
+            } catch {
+                Write-Log "Error processing modules for process $($process.Name): $_" -EntryType "Error" -Color "Red"
+            }
+        }
+        Write-Log "DLL scan complete."
+    } catch {
+        Write-Log "Error in DLL scanning: $_" -EntryType "Error" -Color "Red"
+    }
+}
+
+# Telemetry corruption
+function Corrupt-Telemetry {
+    Write-Log "Corrupting telemetry and environment data..."
     try {
         # Registry modifications
         $telemetryKeys = @(
@@ -608,7 +753,7 @@ function Corrupt-Telemetry-GS {
                     [System.IO.File]::WriteAllBytes($_.FullName, $randomData)
                     Write-Log "Corrupted diagnostic file: $($_.FullName)"
                 } catch {
-                    Write-Log "Failed to corrupt ${file}: $_" -EntryType "Warning" -Color "Yellow"
+                    Write-Log "Failed to corrupt $($_.FullName): $_" -EntryType "Warning" -Color "Yellow"
                 }
             }
         }
@@ -617,7 +762,7 @@ function Corrupt-Telemetry-GS {
         foreach ($log in $eventLogs) {
             try {
                 Clear-EventLog -LogName $log -ErrorAction SilentlyContinue
-                Write-Log "Cleared event log: ${log}"
+                Write-Log "Cleared event log: $log"
             } catch {
                 Write-Log "Failed to clear event log ${log}: $_" -EntryType "Warning" -Color "Yellow"
             }
@@ -672,528 +817,312 @@ function Corrupt-Telemetry-GS {
                 }
             }
         }
-        Write-Log "Telemetry and environment corruption (GS) complete."
+        Write-Log "Telemetry and environment corruption complete."
     } catch {
-        Write-Log "Error corrupting telemetry (GS): $_" -EntryType "Error" -Color "Red"
+        Write-Log "Error corrupting telemetry: $_" -EntryType "Error" -Color "Red"
     }
 }
 
-# VPN monitoring (from GS.ps1)
-function Monitor-VPN-GS {
-    Write-Log "Monitoring VPN connections (GS)..."
+# VPN monitoring
+function Monitor-VPN {
+    Write-Log "Starting VPN monitoring and auto-connection..."
     try {
-        $initialState = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match "VPN" } | Select-Object -ExpandProperty Status
+        # Helper function to fetch public VPN server
+        function Get-PublicVPN {
+            try {
+                $response = Invoke-RestMethod -Uri "https://www.vpngate.net/api/iphone/" -TimeoutSec 5
+                $lines = $response -split "`n"
+                $servers = $lines | Where-Object { $_ -match "," -and ($_.Split(",").Count -gt 6) } | ForEach-Object { $_.Split(",") }
+                if ($servers) {
+                    $validServers = $servers | Where-Object { $_[6] -match '^\d+$' } | Sort-Object { [int]$_[6] }
+                    if ($validServers) {
+                        $host = $validServers[0][1]
+                        $country = $validServers[0][2]
+                        $ping = $validServers[0][6]
+                        Write-Log "Selected closest VPN server: $host ($country, ping: ${ping}ms)" -Color "Yellow"
+                        return $host, $country
+                    }
+                }
+                Write-Log "No valid VPN servers available." -EntryType "Warning" -Color "Yellow"
+                return $null, $null
+            } catch {
+                Write-Log "Failed to fetch VPN server: $_" -EntryType "Error" -Color "Red"
+                return $null, $null
+            }
+        }
+
+        # Helper function to check VPN status
+        function Check-VPN {
+            try {
+                $output = rasdial | Out-String
+                $isConnected = $output -match "Connected"
+                if ($isConnected) {
+                    Write-Log "VPN status: Connected" -Color "Green"
+                } else {
+                    Write-Log "VPN status: Disconnected" -Color "Yellow"
+                }
+                return $isConnected
+            } catch {
+                Write-Log "Failed to check VPN status: $_" -EntryType "Error" -Color "Red"
+                return $false
+            }
+        }
+
+        # Helper function to connect to VPN
+        function Connect-VPN {
+            param ([string]$Host)
+            if (-not $Host) {
+                Write-Log "No VPN host provided." -EntryType "Error" -Color "Red"
+                return $false
+            }
+            Write-Log "Connecting to VPN: $Host"
+            try {
+                $result = Start-Process -FilePath "rasdial" -ArgumentList "MyVPN $Host vpn vpn" -NoNewWindow -Wait -PassThru -RedirectStandardOutput "vpn_output.txt" -RedirectStandardError "vpn_error.txt"
+                $output = Get-Content -Path "vpn_output.txt" -ErrorAction SilentlyContinue
+                $errorOutput = Get-Content -Path "vpn_error.txt" -ErrorAction SilentlyContinue
+                Remove-Item -Path "vpn_output.txt", "vpn_error.txt" -ErrorAction SilentlyContinue
+                if ($result.ExitCode -ne 0) {
+                    Write-Log "VPN connection failed: $errorOutput" -EntryType "Error" -Color "Red"
+                    return $false
+                }
+                Write-Log "Successfully connected to VPN: $Host" -Color "Green"
+                return $true
+            } catch {
+                Write-Log "VPN connection error: $_" -EntryType "Error" -Color "Red"
+                return $false
+            }
+        }
+
+        # Helper function to disconnect VPN
+        function Disconnect-VPN {
+            try {
+                $result = Start-Process -FilePath "rasdial" -ArgumentList "MyVPN disconnect" -NoNewWindow -Wait -PassThru -RedirectStandardOutput "vpn_output.txt" -RedirectStandardError "vpn_error.txt"
+                $errorOutput = Get-Content -Path "vpn_error.txt" -ErrorAction SilentlyContinue
+                Remove-Item -Path "vpn_output.txt", "vpn_error.txt" -ErrorAction SilentlyContinue
+                if ($result.ExitCode -ne 0) {
+                    Write-Log "VPN disconnection failed: $errorOutput" -EntryType "Error" -Color "Red"
+                    return $false
+                }
+                Write-Log "VPN disconnected" -Color "Yellow"
+                return $true
+            } catch {
+                Write-Log "VPN disconnection error: $_" -EntryType "Error" -Color "Red"
+                return $false
+            }
+        }
+
+        # Ensure script termination disconnects VPN
+        $global:DisconnectOnExit = {
+            if (Check-VPN) {
+                Disconnect-VPN
+            }
+        }
+        Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action $global:DisconnectOnExit
+
+        # Main VPN monitoring loop
         while ($true) {
-            $currentState = Get-NetAdapter | Where-Object { $_.InterfaceDescription -match "VPN" } | Select-Object -ExpandProperty Status
-            if ($initialState -ne $currentState) {
-                Write-Log "VPN status changed: $initialState -> $currentState" -EntryType "Warning" -Color "Yellow"
-                $initialState = $currentState
-            }
-            Start-Sleep -Seconds 60
-        }
-    } catch {
-        Write-Log "Error monitoring VPN (GS): $_" -EntryType "Error" -Color "Red"
-    }
-}
-
-# Kill DLLs (from GS3.ps1 and GS.ps1)
-function Kill-DLLs-GS3 {
-    Write-Log "Killing processes using suspicious DLLs (GS3)..."
-    try {
-        $nonStandardPaths = @(
-            "$env:APPDATA\*",
-            "$env:LOCALAPPDATA\*",
-            "$env:TEMP\*",
-            "$env:USERPROFILE\Downloads\*"
-        )
-        $processes = Get-Process | Where-Object { $_.Modules }
-        foreach ($process in $processes) {
-            if ($whitelistedProcesses -contains $process.Name.ToLower()) { continue }
-            foreach ($module in $process.Modules) {
-                $modulePath = $module.FileName
-                if ($nonStandardPaths | Where-Object { $modulePath -like $_ }) {
-                    try {
-                        Stop-Process -Id $process.Id -Force -ErrorAction Stop
-                        Write-Log "Killed process $($process.Name) (PID: $($process.Id)) using DLL from non-standard path: $modulePath"
-                        Quarantine-File-GS3 -filePath $modulePath
-                    } catch {
-                        Write-Log "Failed to kill process $($process.Name) for DLL ${modulePath}: $_" -EntryType "Error" -Color "Red"
-                    }
-                } elseif (-not (Is-SignedFileValid-GS3 -filePath $modulePath)) {
-                    try {
-                        Stop-Process -Id $process.Id -Force -ErrorAction Stop
-                        Write-Log "Killed process $($process.Name) (PID: $($process.Id)) using unsigned DLL: $modulePath"
-                        Quarantine-File-GS3 -filePath $modulePath
-                    } catch {
-                        Write-Log "Failed to kill process $($process.Name) for unsigned DLL ${modulePath}: $_" -EntryType "Error" -Color "Red"
-                    }
+            if (-not (Check-VPN)) {
+                $host, $country = Get-PublicVPN
+                if ($host) {
+                    Connect-VPN -Host $host
+                } else {
+                    Write-Log "No VPN server available. Retrying in 60 seconds..." -EntryType "Warning" -Color "Yellow"
+                    Start-Sleep -Seconds 60
                 }
             }
+            Start-Sleep -Seconds 30
         }
     } catch {
-        Write-Log "Error killing DLLs (GS3): $_" -EntryType "Error" -Color "Red"
+        Write-Log "Error in VPN monitoring: $_" -EntryType "Error" -Color "Red"
     }
 }
 
-# Kill VMs (from GS.ps1)
-function Kill-VMs-GS {
-    Write-Log "Killing virtual machine processes (GS)..."
-    $vmProcesses = @("vmware-vmx", "VBoxHeadless", "VBoxSVC", "vmnat", "vmnetdhcp", "qemu-system-x86_64", "hyperv")
-    foreach ($proc in $vmProcesses) {
-        $processes = Get-Process -Name $proc -ErrorAction SilentlyContinue
-        foreach ($process in $processes) {
-            try {
-                Stop-Process -Id $process.Id -Force -ErrorAction Stop
-                Write-Log "Killed VM process: $($process.Name) (PID: $($process.Id))"
-            } catch {
-                Write-Log "Failed to kill VM process $($process.Name): $_" -EntryType "Error" -Color "Red"
-            }
-        }
-    }
-    $vmServices = @("VMwareHostd", "VBoxSDS", "VMTools")
-    foreach ($service in $vmServices) {
-        if (Get-Service -Name $service -ErrorAction SilentlyContinue) {
-            Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
-            Set-Service -Name $service -StartupType Disabled -ErrorAction SilentlyContinue
-            Write-Log "Disabled VM service: $service"
-        }
-    }
-    Write-Log "VM killing (GS) complete."
-}
-
-# Kill web servers (from GS.ps1)
-function Kill-WebServers-GS {
-    Write-Log "Killing web server processes and services (GS)..."
-    $webProcesses = @("w3wp", "httpd", "nginx")
-    foreach ($proc in $webProcesses) {
-        $processes = Get-Process -Name $proc -ErrorAction SilentlyContinue
-        foreach ($process in $processes) {
-            try {
-                Stop-Process -Id $process.Id -Force -ErrorAction Stop
-                Write-Log "Killed web server process: $($process.Name) (PID: $($process.Id))"
-            } catch {
-                Write-Log "Failed to kill web server process $($process.Name): $_" -EntryType "Error" -Color "Red"
-            }
-        }
-    }
-    $webServices = @("W3SVC", "HTTP")
-    foreach ($service in $webServices) {
-        if (Get-Service -Name $service -ErrorAction SilentlyContinue) {
-            Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
-            Set-Service -Name $service -StartupType Disabled -ErrorAction SilentlyContinue
-            Write-Log "Disabled web server service: $service"
-        }
-    }
-    $ruleName = "Block Web Ports"
-    if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort 80,443 -Action Block -ErrorAction SilentlyContinue
-        Write-Log "Blocked web server ports 80 and 443"
-    }
-    Write-Log "Web server killing (GS) complete."
-}
-
-# Antivirus functions (from GS3.ps1)
-function Stop-ProcessUsingDLL-GS3 {
-    param ([string]$filePath)
+# Security rule application (YARA, Sigma, Snort)
+function Apply-SecurityRules {
+    Write-Log "Applying security rules (YARA, Sigma, Snort)..."
     try {
-        $processes = Get-Process | Where-Object { $_.Modules | Where-Object { $_.FileName -eq $filePath } }
-        foreach ($process in $processes) {
-            taskkill /F /PID $process.Id | Out-Null
-            Write-Log "Killed process $($process.Name) (PID: $($process.Id)) (GS3)"
-            $parentId = (Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($process.Id)").ParentProcessId
-            if ($parentId -and $parentId -ne 0 -and $parentId -ne $process.Id) {
-                $parentProc = Get-Process -Id $parentId -ErrorAction SilentlyContinue
-                if ($parentProc) {
-                    taskkill /F /PID $parentId | Out-Null
-                    Write-Log "Killed parent process $($parentProc.Name) (PID: $parentId) (GS3)"
-                }
+        # YARA rules
+        $yaraRulesPath = "C:\SecurityRules\yara_rules"
+        if (Test-Path $yaraRulesPath) {
+            Get-ChildItem -Path $yaraRulesPath -Filter "*.yar" | ForEach-Object {
+                Write-Log "Applying YARA rule: $($_.FullName)"
+                # Placeholder for YARA scanning
             }
         }
+        # Sigma rules
+        $sigmaRulesPath = "C:\SecurityRules\sigma_rules"
+        if (Test-Path $sigmaRulesPath) {
+            Get-ChildItem -Path $sigmaRulesPath -Filter "*.yml" | ForEach-Object {
+                Write-Log "Applying Sigma rule: $($_.FullName)"
+                # Placeholder for Sigma rule processing
+            }
+        }
+        # Snort rules
+        $snortRulesPath = "C:\SecurityRules\snort_rules"
+        if (Test-Path $snortRulesPath) {
+            Get-ChildItem -Path $snortRulesPath -Filter "*.rules" | ForEach-Object {
+                Write-Log "Applying Snort rule: $($_.FullName)"
+                # Placeholder for Snort rule processing
+            }
+        }
+        Write-Log "Security rules applied."
     } catch {
-        Write-Log "Failed to stop process using ${filePath} (GS3): $_" -EntryType "Error" -Color "Red"
+        Write-Log "Error applying security rules: $_" -EntryType "Error" -Color "Red"
     }
 }
 
-function Set-FileOwnershipAndPermissions-GS3 {
-    param ([string]$filePath)
+# Device restriction
+function Restrict-Devices {
+    Write-Log "Restricting non-critical devices..."
     try {
-        takeown /F $filePath /A | Out-Null
-        icacls $filePath /inheritance:d | Out-Null
-        icacls $filePath /grant "Administrators:F" | Out-Null
-        Write-Log "Set ownership and permissions for ${filePath} (GS3)"
-        return $true
-    } catch {
-        Write-Log "Failed to set ownership/permissions for ${filePath} (GS3): $_" -EntryType "Error" -Color "Red"
-        return $false
-    }
-}
-
-function Is-SignedFileValid-GS3 {
-    param ([string]$filePath)
-    try {
-        $signature = Get-AuthenticodeSignature -FilePath $filePath -ErrorAction Stop
-        Write-Log "Signature status: $($signature.Status) for ${filePath} (GS3)"
-        return ($signature.Status -eq "Valid")
-    } catch {
-        Write-Log "Signature check failed for ${filePath} (GS3): $_" -EntryType "Error" -Color "Red"
-        return $false
-    }
-}
-
-function Quarantine-File-GS3 {
-    param ([string]$filePath)
-    $maxRetries = 3
-    $retryCount = 0
-    $success = $false
-    while (-not $success -and $retryCount -lt $maxRetries) {
-        try {
-            $quarantinePath = Join-Path -Path $quarantineFolder -ChildPath (Split-Path $filePath -Leaf)
-            Move-Item -Path $filePath -Destination $quarantinePath -Force -ErrorAction Stop
-            Write-Log "Quarantined file: ${filePath} to $quarantinePath (GS3)"
-            $success = $true
-        } catch {
-            Write-Log "Retry $($retryCount + 1)/$maxRetries - Failed to quarantine ${filePath} (GS3): $_" -EntryType "Warning" -Color "Yellow"
-            Start-Sleep -Seconds 1
-            $retryCount++
+        $currentSessionId = (Get-Process -PID $PID).SessionId
+        $criticalClasses = @("DiskDrive", "Volume", "Processor", "System", "Computer", "USB", "Net")
+        function Test-DeviceSession([string]$DeviceInstanceId) {
+            return $true  # Placeholder
         }
-    }
-    if (-not $success) {
-        Write-Log "Quarantine of ${filePath} failed after $maxRetries retries (GS3)" -EntryType "Error" -Color "Red"
-    }
-}
-
-# VirusTotal scanning (from GS.ps1)
-function Get-VirusTotalScan-GS {
-    param ([string]$FilePath)
-    $fileHash = (Get-FileHash -Algorithm SHA256 -Path $FilePath -ErrorAction SilentlyContinue).Hash
-    if ($scannedFiles.ContainsKey($fileHash)) {
-        Write-Log "File hash $fileHash found in cache (clean) (GS)."
-        return $null
-    }
-    $headers = @{"x-apikey" = $VirusTotalApiKey}
-    $fileSize = (Get-Item $FilePath -ErrorAction SilentlyContinue).Length
-    $url = "https://www.virustotal.com/api/v3/files/$fileHash"
-    try {
-        $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction SilentlyContinue
-        if ($response -and $response.data.attributes.last_analysis_stats.malicious -eq 0) {
-            Write-Log "File $FilePath is clean, already scanned (GS)."
-            $scannedFiles[$fileHash] = $true
-            return $response
-        } elseif ($response) {
-            Write-Log "File $FilePath found in VirusTotal with malicious detections (GS)."
-            return $response
-        }
-    } catch {
-        Write-Log "File $FilePath not found in VirusTotal database or error occurred (GS): $_" -EntryType "Warning" -Color "Yellow"
-    }
-    if ($fileSize -gt 32MB) {
-        Write-Log "File $FilePath exceeds 32MB VirusTotal limit. Skipping upload (GS)." -EntryType "Warning" -Color "Yellow"
-        return $null
-    }
-    Write-Log "Uploading file $FilePath to VirusTotal for analysis (GS)."
-    $uploadUrl = "https://www.virustotal.com/api/v3/files"
-    $fileContent = [System.IO.File]::ReadAllBytes($FilePath)
-    $boundary = [System.Guid]::NewGuid().ToString()
-    $body = @"
---$boundary
-Content-Disposition: form-data; name="file"; filename="$([System.IO.Path]::GetFileName($FilePath))"
-Content-Type: application/octet-stream
-
-$([System.Text.Encoding]::Default.GetString($fileContent))
---$boundary--
-"@
-    try {
-        $uploadResponse = Invoke-RestMethod -Uri $uploadUrl -Headers $headers -Method Post -ContentType "multipart/form-data; boundary=$boundary" -Body $body -ErrorAction Stop
-        $analysisId = $uploadResponse.data.id
-        Write-Log "File $FilePath uploaded to VirusTotal. Analysis ID: $analysisId (GS)"
-        $analysisUrl = "https://www.virustotal.com/api/v3/analyses/$analysisId"
-        $maxAttempts = 10
-        $attempt = 0
-        $delaySeconds = 30
-        do {
-            Start-Sleep -Seconds $delaySeconds
-            $attempt++
-            $analysisResponse = Invoke-RestMethod -Uri $analysisUrl -Headers $headers -Method Get -ErrorAction Stop
-            if ($analysisResponse.data.attributes.status -eq "completed") {
-                Write-Log "Analysis for $FilePath completed (GS)."
-                break
+        $devices = Get-PnpDevice | Select-Object -Property Name, InstanceId, Status, Class
+        foreach ($device in $devices) {
+            if ($device.Status -eq "Error") {
+                Write-Log "Device '$($device.Name)' already disabled"
+                continue
             }
-            Write-Log "Waiting for analysis of $FilePath (Attempt $attempt/$maxAttempts) (GS)..."
-        } while ($attempt -lt $maxAttempts)
-        if ($analysisResponse.data.attributes.status -ne "completed") {
-            Write-Log "Analysis for $FilePath did not complete within time limit (GS)." -EntryType "Warning" -Color "Yellow"
-            return $null
-        }
-        $scanResults = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
-        if ($scanResults.data.attributes.last_analysis_stats.malicious -eq 0) {
-            Write-Log "File $FilePath is clean according to VirusTotal (GS)."
-            $scannedFiles[$fileHash] = $true
-        }
-        return $scanResults
-    } catch {
-        Write-Log "Error uploading or analyzing $FilePath with VirusTotal (GS): $_" -EntryType "Error" -Color "Red"
-        return $null
-    }
-}
-
-# Block execution (from GS.ps1)
-function Block-Execution-GS {
-    param ([string]$FilePath, [string]$Reason)
-    try {
-        $acl = Get-Acl -Path $FilePath -ErrorAction Stop
-        $acl.SetAccessRuleProtection($true, $false)
-        $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) }
-        Set-Acl -Path $FilePath -AclObject $acl -ErrorAction Stop
-        Write-Log "Blocked file ${FilePath}: ${Reason} (GS)"
-    } catch {
-        Write-Log "Error blocking execution of ${FilePath} (GS): $_" -EntryType "Error" -Color "Red"
-    }
-}
-
-# File system monitoring (from GS3.ps1)
-function Monitor-FileSystem-GS3 {
-    Write-Log "Setting up file system monitoring (GS3)..."
-    $drives = Get-CimInstance -ClassName Win32_LogicalDisk | Where-Object { $_.DriveType -in 2, 3, 4 }
-    foreach ($drive in $drives) {
-        $path = $drive.DeviceID + "\"
-        try {
-            $watcher = New-Object System.IO.FileSystemWatcher
-            $watcher.Path = $path
-            $watcher.IncludeSubdirectories = $true
-            $watcher.Filter = "*.dll"
-            $watcher.EnableRaisingEvents = $true
-            Register-ObjectEvent -InputObject $watcher -EventName "Created" -Action {
-                Start-Sleep -Milliseconds 500
-                $fullPath = $Event.SourceEventArgs.FullPath
-                if (Test-Path $fullPath -PathType Leaf -and $fullPath -like "*.dll") {
-                    $isValid = Is-SignedFileValid-GS3 -filePath $fullPath
-                    if (-not $isValid) {
-                        if (Set-FileOwnershipAndPermissions-GS3 -filePath $fullPath) {
-                            Stop-ProcessUsingDLL-GS3 -filePath $fullPath
-                            Quarantine-File-GS3 -filePath $fullPath
-                        }
-                    }
-                }
-                $scanResults = Get-VirusTotalScan-GS -FilePath $fullPath
-                if ($scanResults -and $scanResults.data.attributes.last_analysis_stats.malicious -gt 0) {
-                    Block-Execution-GS -FilePath $fullPath -Reason "File detected as malware on VirusTotal"
-                }
-            } | Out-Null
-            Register-ObjectEvent -InputObject $watcher -EventName "Changed" -Action {
-                Start-Sleep -Milliseconds 500
-                $fullPath = $Event.SourceEventArgs.FullPath
-                if (Test-Path $fullPath -PathType Leaf -and $fullPath -like "*.dll") {
-                    $isValid = Is-SignedFileValid-GS3 -filePath $fullPath
-                    if (-not $isValid) {
-                        if (Set-FileOwnershipAndPermissions-GS3 -filePath $fullPath) {
-                            Stop-ProcessUsingDLL-GS3 -filePath $fullPath
-                            Quarantine-File-GS3 -filePath $fullPath
-                        }
-                    }
-                }
-            } | Out-Null
-            Write-Log "File system watcher set on drive: $path (GS3)"
-        } catch {
-            Write-Log "Failed to start watcher on ${path} (GS3): $_" -EntryType "Error" -Color "Red"
-        }
-    }
-}
-
-# Security rules (from GSecurity.ps1)
-function Apply-SecurityRules-GSecurity {
-    Write-Log "Applying security rules (GSecurity)..."
-    function Get-SecurityRules {
-        $tempDir = "$env:TEMP\security_rules"
-        if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Path $tempDir | Out-Null }
-        $yaraZip = "$tempDir\yara_rules.zip"
-        Invoke-WebRequest -Uri "https://github.com/Yara-Rules/rules/archive/refs/heads/master.zip" -OutFile $yaraZip -ErrorAction Stop
-        Expand-Archive -Path $yaraZip -DestinationPath "$tempDir\yara" -Force
-        $yaraRules = Get-ChildItem -Path "$tempDir\yara" -Recurse -Include "*.yar"
-        $sigmaZip = "$tempDir\sigma_rules.zip"
-        Invoke-WebRequest -Uri "https://github.com/SigmaHQ/sigma/archive/refs/heads/master.zip" -OutFile $sigmaZip -ErrorAction Stop
-        Expand-Archive -Path $sigmaZip -DestinationPath "$tempDir\sigma" -Force
-        $sigmaRules = Get-ChildItem -Path "$tempDir\sigma" -Recurse -Include "*.yml"
-        $snortRules = "$tempDir\snort.rules"
-        Invoke-WebRequest -Uri "https://www.snort.org/downloads/community/community-rules" -OutFile $snortRules -ErrorAction Stop
-        Write-Log "Successfully downloaded YARA, Sigma, and Snort rules (GSecurity)."
-        return @{ Yara = $yaraRules; Sigma = $sigmaRules; Snort = $snortRules }
-    }
-    function Parse-Rules {
-        param ($Rules)
-        $indicators = @()
-        foreach ($rule in $Rules.Yara) {
-            $content = Get-Content $rule.FullName -ErrorAction SilentlyContinue
-            if ($content -match 'meta:.*hash\s*=\s*"([a-f0-9]{32,64})"') {
-                $indicators += @{ Type = "Hash"; Value = $matches[1]; Source = "YARA" }
+            if ($criticalClasses -contains $device.Class) {
+                Write-Log "Skipping critical device: $($device.Name) (Class: $($device.Class))"
+                continue
             }
-            if ($content -match 'meta:.*filename\s*=\s*"([^"]+)"') {
-                $indicators += @{ Type = "FileName"; Value = $matches[1]; Source = "YARA" }
-            }
-        }
-        foreach ($rule in $Rules.Sigma) {
-            $content = Get-Content $rule.FullName -ErrorAction SilentlyContinue
-            if ($content -match 'process_creation:.*image:.*\\([^\s]+.exe)') {
-                $indicators += @{ Type = "FileName"; Value = $matches[1]; Source = "Sigma" }
-            }
-        }
-        if (Test-Path $Rules.Snort) {
-            foreach ($line in (Get-Content $Rules.Snort -ErrorAction SilentlyContinue)) {
-                if ($line -match 'alert.*dst\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})') {
-                    $indicators += @{ Type = "IP"; Value = $matches[1]; Source = "Snort" }
-                }
-            }
-        }
-        Write-Log "Parsed $($indicators.Count) indicators from rules (GSecurity)."
-        return $indicators
-    }
-    function Apply-Rules {
-        param ($Indicators)
-        $asrRules = @{}
-        foreach ($indicator in $Indicators) {
-            if ($indicator.Type -eq "FileName" -and $indicator.Source -in @("YARA", "Sigma")) {
-                $asrRules[$indicator.Value] = $true
-            }
-        }
-        foreach ($exe in $asrRules.Keys) {
-            try {
-                Add-MpPreference -AttackSurfaceReductionRules_Ids "e6db77e5-3df2-4cf1-b95a-636979351e5b" `
-                                 -AttackSurfaceReductionRules_Actions Enabled `
-                                 -AttackSurfaceReductionRules_ExecutablePaths $exe -ErrorAction Stop
-                Write-Log "Blocked executable via ASR: $exe (GSecurity)"
-            } catch {
-                Write-Log "Error applying ASR rule for ${exe} (GSecurity): $_" -EntryType "Warning" -Color "Yellow"
-            }
-        }
-        foreach ($indicator in $Indicators) {
-            if ($indicator.Type -eq "IP") {
+            $isCurrentSessionDevice = Test-DeviceSession -DeviceInstanceId $device.InstanceId
+            if (-not $isCurrentSessionDevice) {
                 try {
-                    New-NetFirewallRule -Name "Block_C2_$($indicator.Value)" -Direction Outbound -Action Block `
-                                       -RemoteAddress $indicator.Value -ErrorAction Stop
-                    Write-Log "Blocked IP via Firewall: $($indicator.Value) (GSecurity)"
+                    Disable-PnpDevice -InstanceId $device.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+                    Write-Log "Disabled device: $($device.Name) (Class: $($device.Class))"
                 } catch {
-                    Write-Log "Error applying Firewall rule for $($indicator.Value) (GSecurity): $_" -EntryType "Warning" -Color "Yellow"
+                    Write-Log "Failed to disable $($device.Name): $_" -EntryType "Warning" -Color "Yellow"
                 }
             }
         }
+        Write-Log "Device restriction complete."
+    } catch {
+        Write-Log "Error restricting devices: $_" -EntryType "Error" -Color "Red"
     }
-    function Start-ProcessMonitor {
-        param ($Indicators)
-        $fileNames = $Indicators | Where-Object { $_.Type -eq "FileName" } | Select-Object -ExpandProperty Value
-        Register-WmiEvent -Query "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'" -Action {
-            $process = $event.SourceEventArgs.NewEvent.TargetInstance
-            if ($fileNames -contains $process.Name) {
-                try {
-                    Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
-                    Write-Log "Blocked malicious process: $($process.Name) (GSecurity)" -EntryType "Warning" -Color "Yellow"
-                } catch {
-                    Write-Log "Error blocking process $($process.Name) (GSecurity): $_" -EntryType "Error" -Color "Red"
-                }
-            }
-        }
-        Write-Log "Process monitoring started (GSecurity)."
-    }
-    if ($Start) {
-        $tempDir = "$env:TEMP\security_rules"
-        if (Test-Path $tempDir) {
-            $rules = @{
-                Yara = Get-ChildItem -Path "$tempDir\yara" -Recurse -Include "*.yar" -ErrorAction SilentlyContinue
-                Sigma = Get-ChildItem -Path "$tempDir\sigma" -Recurse -Include "*.yml" -ErrorAction SilentlyContinue
-                Snort = "$tempDir\snort.rules"
-            }
-            $indicators = Parse-Rules -Rules $rules
-            Apply-Rules -Indicators $indicators
-            Start-ProcessMonitor -Indicators $indicators
-        } else {
-            Write-Log "Cached rules not found. Downloading new rules (GSecurity)." -EntryType "Warning" -Color "Yellow"
-            $rules = Get-SecurityRules
-            $indicators = Parse-Rules -Rules $rules
-            Apply-Rules -Indicators $indicators
-            Start-ProcessMonitor -Indicators $indicators
-        }
-    } else {
-        $rules = Get-SecurityRules
-        $indicators = Parse-Rules -Rules $rules
-        Apply-Rules -Indicators $indicators
-        Start-ProcessMonitor -Indicators $indicators
-    }
-    Write-Log "Security rules (GSecurity) applied."
 }
 
-# Process monitoring (from GS.ps1)
-function Monitor-Processes-GS {
-    Write-Log "Starting process monitoring (GS)..."
-    Register-WmiEvent -Query "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'" -Action {
-        $process = $event.SourceEventArgs.NewEvent.TargetInstance
-        if ($script:whitelistedProcesses -notcontains $process.Name.ToLower()) {
-            Write-Log "New process detected: $($process.Name) (PID: $($process.ProcessId)) (GS)"
-            $isValid = Is-SignedFileValid-GS3 -filePath $process.ExecutablePath
-            if (-not $isValid) {
-                try {
-                    Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
-                    Write-Log "Terminated unsigned process: $($process.Name) (GS)" -EntryType "Warning" -Color "Yellow"
-                } catch {
-                    Write-Log "Error terminating process $($process.Name) (GS): $_" -EntryType "Error" -Color "Red"
+# UAC configuration
+function Configure-UAC {
+    Write-Log "Configuring UAC..."
+    try {
+        $uacKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        Set-ItemProperty -Path $uacKey -Name "ConsentPromptBehaviorAdmin" -Value 5 -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $uacKey -Name "ConsentPromptBehaviorUser" -Value 3 -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $uacKey -Name "EnableLUA" -Value 1 -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $uacKey -Name "PromptOnSecureDesktop" -Value 1 -ErrorAction SilentlyContinue
+        Write-Log "UAC configured to highest notification level."
+    } catch {
+        Write-Log "Error configuring UAC: $_" -EntryType "Error" -Color "Red"
+    }
+}
+
+# Process monitoring
+function Monitor-Processes {
+    Write-Log "Starting process monitoring..."
+    try {
+        $knownMalicious = @("malware.exe", "trojan.exe", "ransomware.exe")
+        while ($true) {
+            $processes = Get-Process | Where-Object { $_.Path -and $whitelistedProcesses -notcontains $_.Name }
+            foreach ($process in $processes) {
+                if ($knownMalicious -contains $process.Name) {
+                    Write-Log "Malicious process detected: $($process.Name) (PID: $($process.Id))" -EntryType "Warning" -Color "Yellow"
+                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                    Write-Log "Terminated malicious process: $($process.Name)"
                 }
             }
+            Start-Sleep -Seconds 10
         }
+    } catch {
+        Write-Log "Error in process monitoring: $_" -EntryType "Error" -Color "Red"
     }
-    Write-Log "Process monitoring (GS) started."
+}
+
+# Kill VMs
+function Kill-VMs {
+    Write-Log "Scanning for virtual machines..."
+    try {
+        $vmProcesses = @("vmware-vmx", "VBoxHeadless", "qemu-system-x86_64", "VirtualBoxVM")
+        $processes = Get-Process | Where-Object { $vmProcesses -contains $_.Name }
+        foreach ($process in $processes) {
+            Write-Log "Virtual machine process detected: $($process.Name) (PID: $($process.Id))" -EntryType "Warning" -Color "Yellow"
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            Write-Log "Terminated VM process: $($process.Name)"
+        }
+        Write-Log "VM scan complete."
+    } catch {
+        Write-Log "Error in VM scanning: $_" -EntryType "Error" -Color "Red"
+    }
+}
+
+# Kill web servers
+function Kill-WebServers {
+    Write-Log "Scanning for web server processes..."
+    try {
+        $webServerProcesses = @("httpd", "nginx", "apache2", "iisexpress", "w3wp")
+        $processes = Get-Process | Where-Object { $webServerProcesses -contains $_.Name }
+        foreach ($process in $processes) {
+            Write-Log "Web server process detected: $($process.Name) (PID: $($process.Id))" -EntryType "Warning" -Color "Yellow"
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            Write-Log "Terminated web server process: $($process.Name)"
+        }
+        Write-Log "Web server scan complete."
+    } catch {
+        Write-Log "Error in web server scanning: $_" -EntryType "Error" -Color "Red"
+    }
 }
 
 # Main execution
-try {
-    Write-Log "Starting CombinedSecurity script..."
-    Initialize-Quarantine
-    if (-not $Start) {
-        Schedule-StartupTask
-        if ($AddToStartup) {
-            Add-ToStartup
+function Main {
+    Write-Log "Starting GSecurity script..."
+    try {
+        Initialize-Quarantine
+        # Execute all security functions automatically
+        $functions = @(
+            "Harden-BrowserVirtualization",
+            "Harden-AudioSettings-Enhancements",
+            "Harden-AudioSettings",
+            "Harden-BrowserSettings",
+            "Disable-ChromeRemoteDesktop",
+            "Harden-NetworkAndServices",
+            "Optimize-Network",
+            "Harden-PrivilegeRights-Policy",
+            "Harden-PrivilegeRights",
+            "Harden-WDACPolicy",
+            "Restrict-Devices",
+            "Configure-UAC",
+            "Kill-DLLs",
+            "Monitor-FileSystem",
+            "Corrupt-Telemetry",
+            "Monitor-VPN",
+            "Apply-SecurityRules",
+            "Monitor-Processes",
+            "Kill-VMs",
+            "Kill-WebServers"
+        )
+        foreach ($func in $functions) {
+            try {
+                Write-Log "Executing $func..."
+                & $func
+            } catch {
+                Write-Log "Error executing ${func}: $_" -EntryType "Error" -Color "Red"
+            }
         }
+    } catch {
+        Write-Log "Critical error in main execution: $_" -EntryType "Error" -Color "Red"
+        exit 1
     }
-    # Execute all hardening functions
-    Harden-BrowserVirtualization-GS2
-    Harden-AudioSettings-GS2
-    Harden-AudioSettings-GSecurity
-    Harden-BrowserSettings-GSecurity
-    Disable-ChromeRemoteDesktop-GS2
-    Harden-NetworkAndServices-GS2
-    Optimize-Network-GSecurity
-    Harden-PrivilegeRights-GS2
-    Harden-PrivilegeRights-GS
-    Harden-WDACPolicy-GS2
-    Restrict-Devices-GSecurity
-    Configure-UAC-GS
-    Kill-DLLs-GS3
-    Kill-VMs-GS
-    Kill-WebServers-GS
-    # Execute telemetry corruption periodically
-    if ((Get-Date) - $lastTelemetryCorruptTime -gt (New-TimeSpan -Hours 24)) {
-        Corrupt-Telemetry-GS
-        $script:lastTelemetryCorruptTime = Get-Date
-    }
-    # Start monitoring functions in background
-    $job1 = Start-Job -ScriptBlock { Monitor-VPN-GS }
-    $job2 = Start-Job -ScriptBlock { Monitor-FileSystem-GS3 }
-    $job3 = Start-Job -ScriptBlock { Apply-SecurityRules-GSecurity }
-    $job4 = Start-Job -ScriptBlock { Monitor-Processes-GS }
-    Write-Log "Started background jobs for VPN, file system, security rules, and process monitoring."
-    # Keep script running
-    while ($true) {
-        Start-Sleep -Seconds 3600
-        if ((Get-Date) - $lastTelemetryCorruptTime -gt (New-TimeSpan -Hours 24)) {
-            Corrupt-Telemetry-GS
-            $lastTelemetryCorruptTime = Get-Date
-        }
-        Kill-DLLs-GS3
-        Kill-VMs-GS
-        Kill-WebServers-GS
-    }
-} catch {
-    Write-Log "Critical error in main execution: $_" -EntryType "Error" -Color "Red"
-    exit 1
-} finally {
-    if ($originalPolicy -ne "Unrestricted") {
-        Set-ExecutionPolicy -ExecutionPolicy $originalPolicy -Scope Process -Force
-        Write-Log "Restored original execution policy: $originalPolicy"
-    }
+}
+
+# Execute main
+Main
+
+# Restore execution policy
+if ($originalPolicy -ne "Unrestricted") {
+    Set-ExecutionPolicy -ExecutionPolicy $originalPolicy -Scope Process -Force -ErrorAction SilentlyContinue
+    Write-Log "Restored execution policy to $originalPolicy"
 }
