@@ -108,6 +108,100 @@ netsh advfirewall firewall add rule name="lsass Dynamic RPC Out" dir=out action=
 netsh advfirewall firewall add rule name="lsass LDAP UDP Out" dir=out action=block protocol=UDP localport=1024-65535 remoteport=389 program="C:\Windows\System32\lsass.exe" profile=any
 netsh advfirewall firewall add rule name="lsass LDAP UDP In" dir=in action=block protocol=UDP localport=389 remoteport=1024-65535 program="C:\Windows\System32\lsass.exe" profile=any
 
+:: Remove symbolic links
+for %%D in (A B C D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
+    if exist "%%D:\" (
+        for /f "delims=" %%F in ('dir /aL /s /b "%%D:\" 2^>nul') do (
+            echo Deleting symbolic link: %%F
+            rmdir "%%F" 2>nul || del "%%F" 2>nul
+        )
+    )
+)
+
+:: Loop through all network adapters and apply the DisablePXE setting
+for /f "tokens=*" %%A in ('reg query "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" /s /f "Name" /k 2^>nul') do (
+    set "adapter=%%A"
+    REM Extract the adapter GUID from the registry key path
+    set "adapter_guid="
+    for /f "tokens=3" %%B in ("!adapter!") do set adapter_guid=%%B
+
+    REM Apply the DisablePXE registry key if the GUID is valid
+    if defined adapter_guid (
+        echo Setting DisablePXE for adapter: !adapter_guid!
+        reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\!adapter_guid!" /v DisablePXE /t REG_DWORD /d 1 /f
+    )
+)
+
+for /f "tokens=*" %%A in ('reg query "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpipv6\Parameters\Interfaces" /s /f "Name" /k 2^>nul') do (
+    set "adapter=%%A"
+    REM Extract the adapter GUID from the registry key path
+    set "adapter_guid="
+    for /f "tokens=3" %%B in ("!adapter!") do set adapter_guid=%%B
+
+    REM Apply the DisablePXE registry key if the GUID is valid
+    if defined adapter_guid (
+        echo Setting DisablePXE for adapter: !adapter_guid!
+        reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpipv6\Parameters\Interfaces\!adapter_guid!" /v DisablePXE /t REG_DWORD /d 1 /f
+    )
+)
+
+:: disable netbios
+sc config lmhosts start= disabled
+@powershell.exe -ExecutionPolicy Bypass -Command "Get-WmiObject -Class Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true } | ForEach-Object { $_.SetTcpipNetbios(2) }"
+wmic nicconfig where TcpipNetbiosOptions=0 call SetTcpipNetbios 2
+wmic nicconfig where TcpipNetbiosOptions=1 call SetTcpipNetbios 2
+reg add "HKLM\System\CurrentControlSet\Services\Dnscache\Parameters" /v "EnableNetbios" /t REG_DWORD /d "0" /f
+
+:: takeown of group policy client service
+SetACL.exe -on "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\gpsvc" -ot reg -actn setowner -ownr n:Administrators
+SetACL.exe -on "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\gpsvc" -ot reg -actn ace -ace "n:Administrators;p:full"
+sc stop gpsvc
+
+:: Hosts
+rem IF EXIST %windir%\SYSTEM32\DRIVERS\ETC\HOSTS*.* ATTRIB +A -H -R -S %windir%\SYSTEM32\DRIVERS\ETC\HOSTS*.*>NUL
+rem IF EXIST %windir%\SYSTEM32\DRIVERS\ETC\HOSTS.MVP DEL %windir%\SYSTEM32\DRIVERS\ETC\HOSTS.MVP>NUL
+rem IF EXIST %windir%\SYSTEM32\DRIVERS\ETC\HOSTS REN %windir%\SYSTEM32\DRIVERS\ETC\HOSTS HOSTS.MVP>NUL
+rem IF EXIST %windir%\SYSTEM32\DRIVERS\ETC\NUL COPY /Y HOSTS %windir%\SYSTEM32\DRIVERS\ETC>NUL
+
+:: Import security policy
+rem lgpo /s secpol.inf
+
+:: Install RamCleaner
+mkdir %windir%\Setup\Scripts
+copy /y emptystandbylist.exe %windir%\Setup\Scripts\emptystandbylist.exe
+copy /y RamCleaner.bat %windir%\Setup\Scripts\RamCleaner.bat
+schtasks /create /tn "RamCleaner" /xml "RamCleaner.xml" /ru "SYSTEM"
+
+:: Install Antivirus
+rem copy /y Antivirus.ps1 %windir%\Setup\Scripts\Antivirus.ps1
+copy /y Antivirus.exe %windir%\Setup\Scripts\Antivirus.exe
+schtasks /create /tn "Antivirus" /xml "Antivirus.xml"
+Regasm "Antivirus.dll" /codebase
+
+:: Install drivers
+rem pnputil.exe /add-driver *.inf /subdirs /install
+
+:: Services stop and disable
+sc stop SSDPSRV
+sc stop upnphost
+sc stop NetBT
+sc stop BTHMODEM
+sc stop LanmanWorkstation
+sc stop LanmanServer
+sc stop seclogon
+sc stop Messenger
+rem sc stop FltMgr
+sc config SSDPSRV start= disabled
+sc config upnphost start= disabled
+sc config NetBT start= disabled
+sc config BTHMODEM start= disabled
+sc config gpsvc start= disabled
+sc config LanmanWorkstation start= disabled
+sc config LanmanServer start= disabled
+sc config seclogon start= disabled
+sc config Messenger start= disabled
+rem sc config FltMgr start= disabled
+
 :: Autopilot
 @powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Uninstall-ProvisioningPackage -AllInstalledPackages"
 rd /s /q %ProgramData%\Microsoft\Provisioning
@@ -204,100 +298,6 @@ takeown /f "%USERPROFILE%\Desktop" /r /d y
 icacls "%USERPROFILE%\Desktop" /inheritance:d /T /C
 icacls "%USERPROFILE%\Desktop" /remove "System"
 icacls "%USERPROFILE%\Desktop" /remove "Administrators"
-
-:: Remove symbolic links
-for %%D in (A B C D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
-    if exist "%%D:\" (
-        for /f "delims=" %%F in ('dir /aL /s /b "%%D:\" 2^>nul') do (
-            echo Deleting symbolic link: %%F
-            rmdir "%%F" 2>nul || del "%%F" 2>nul
-        )
-    )
-)
-
-:: Loop through all network adapters and apply the DisablePXE setting
-for /f "tokens=*" %%A in ('reg query "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces" /s /f "Name" /k 2^>nul') do (
-    set "adapter=%%A"
-    REM Extract the adapter GUID from the registry key path
-    set "adapter_guid="
-    for /f "tokens=3" %%B in ("!adapter!") do set adapter_guid=%%B
-
-    REM Apply the DisablePXE registry key if the GUID is valid
-    if defined adapter_guid (
-        echo Setting DisablePXE for adapter: !adapter_guid!
-        reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\!adapter_guid!" /v DisablePXE /t REG_DWORD /d 1 /f
-    )
-)
-
-for /f "tokens=*" %%A in ('reg query "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpipv6\Parameters\Interfaces" /s /f "Name" /k 2^>nul') do (
-    set "adapter=%%A"
-    REM Extract the adapter GUID from the registry key path
-    set "adapter_guid="
-    for /f "tokens=3" %%B in ("!adapter!") do set adapter_guid=%%B
-
-    REM Apply the DisablePXE registry key if the GUID is valid
-    if defined adapter_guid (
-        echo Setting DisablePXE for adapter: !adapter_guid!
-        reg add "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpipv6\Parameters\Interfaces\!adapter_guid!" /v DisablePXE /t REG_DWORD /d 1 /f
-    )
-)
-
-:: disable netbios
-sc config lmhosts start= disabled
-@powershell.exe -ExecutionPolicy Bypass -Command "Get-WmiObject -Class Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true } | ForEach-Object { $_.SetTcpipNetbios(2) }"
-wmic nicconfig where TcpipNetbiosOptions=0 call SetTcpipNetbios 2
-wmic nicconfig where TcpipNetbiosOptions=1 call SetTcpipNetbios 2
-reg add "HKLM\System\CurrentControlSet\Services\Dnscache\Parameters" /v "EnableNetbios" /t REG_DWORD /d "0" /f
-
-:: takeown of group policy client service
-SetACL.exe -on "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\gpsvc" -ot reg -actn setowner -ownr n:Administrators
-SetACL.exe -on "HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\gpsvc" -ot reg -actn ace -ace "n:Administrators;p:full"
-sc stop gpsvc
-
-:: Hosts
-IF EXIST %windir%\SYSTEM32\DRIVERS\ETC\HOSTS*.* ATTRIB +A -H -R -S %windir%\SYSTEM32\DRIVERS\ETC\HOSTS*.*>NUL
-IF EXIST %windir%\SYSTEM32\DRIVERS\ETC\HOSTS.MVP DEL %windir%\SYSTEM32\DRIVERS\ETC\HOSTS.MVP>NUL
-IF EXIST %windir%\SYSTEM32\DRIVERS\ETC\HOSTS REN %windir%\SYSTEM32\DRIVERS\ETC\HOSTS HOSTS.MVP>NUL
-IF EXIST %windir%\SYSTEM32\DRIVERS\ETC\NUL COPY /Y HOSTS %windir%\SYSTEM32\DRIVERS\ETC>NUL
-
-:: Import security policy
-lgpo /s secpol.inf
-
-:: Install RamCleaner
-mkdir %windir%\Setup\Scripts
-copy /y emptystandbylist.exe %windir%\Setup\Scripts\emptystandbylist.exe
-copy /y RamCleaner.bat %windir%\Setup\Scripts\RamCleaner.bat
-schtasks /create /tn "RamCleaner" /xml "RamCleaner.xml" /ru "SYSTEM"
-
-:: Install Antivirus
-copy /y Antivirus.ps1 %windir%\Setup\Scripts\Antivirus.ps1
-copy /y Antivirus.exe %windir%\Setup\Scripts\Antivirus.exe
-schtasks /create /tn "Antivirus" /xml "Antivirus.xml"
-Regasm "GShield.dll" /codebase
-
-:: Install drivers
-pnputil.exe /add-driver *.inf /subdirs /install
-
-:: Services stop and disable
-sc stop SSDPSRV
-sc stop upnphost
-sc stop NetBT
-sc stop BTHMODEM
-sc stop LanmanWorkstation
-sc stop LanmanServer
-sc stop seclogon
-sc stop Messenger
-rem sc stop FltMgr
-sc config SSDPSRV start= disabled
-sc config upnphost start= disabled
-sc config NetBT start= disabled
-sc config BTHMODEM start= disabled
-sc config gpsvc start= disabled
-sc config LanmanWorkstation start= disabled
-sc config LanmanServer start= disabled
-sc config seclogon start= disabled
-sc config Messenger start= disabled
-rem sc config FltMgr start= disabled
 
 :cleanup_flash
 call :log "Cleaning Adobe Flash Player..."
