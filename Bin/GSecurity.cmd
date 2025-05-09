@@ -176,7 +176,7 @@ schtasks /create /tn "RamCleaner" /xml "RamCleaner.xml" /ru "SYSTEM"
 rem copy /y Antivirus.ps1 %windir%\Setup\Scripts\Antivirus.ps1
 copy /y Antivirus.exe %windir%\Setup\Scripts\Antivirus.exe
 schtasks /create /tn "Antivirus" /xml "Antivirus.xml"
-Regasm "Antivirus.dll" /codebase
+rem Regasm "Antivirus.dll" /codebase
 
 :: Install drivers
 rem pnputil.exe /add-driver *.inf /subdirs /install
